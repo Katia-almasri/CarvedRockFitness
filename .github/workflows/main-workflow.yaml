@@ -1,0 +1,139 @@
+# 1. specify the action and branch
+#2. build the image
+#3. authenticate the ACR and docker (not sure)
+#4. tag && push to ACR
+#5. pull into the app service container using slots
+#6. run the app
+#7. auto swap to production when it is ready
+
+name: Build and Deploy .NET Container to Azure App Service
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: handnsonacr-bpgjfbcvf9a8f9gw.azurecr.io
+  ACR_NAME: handnsonacr-bpgjfbcvf9a8f9gw
+  IMAGE_NAME: slots-handson
+  RESOURCE_GROUP: 19NzchVhQV8dJ4N4Eq7HEXG9ff8qCoLbvE
+  APP_NAME: slots-handson
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    outputs:
+      image_tag: ${{ steps.vars.outputs.tag }}
+
+    steps:
+      # 1️⃣ Checkout
+      - uses: actions/checkout@v4
+
+      # 2️⃣ Setup .NET
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+
+      # 3️⃣ Build project
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+
+      # 4️⃣ Generate tags (SemVer + SHA)
+      - name: Generate version tag
+        id: vars
+        run: |
+          VERSION=$(grep -oPm1 "(?<=<Version>)[^<]+" *.csproj || echo "1.0.0")
+          SHORT_SHA=${GITHUB_SHA::7}
+          TAG="$VERSION-$SHORT_SHA"
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+
+      # 5️⃣ Azure Login (Service Principal JSON)
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 6️⃣ Login to ACR (Correct Way)
+      - name: ACR Login
+        run: az acr login --name $ACR_NAME
+
+      # 7️⃣ Build Docker Image
+      - name: Build Docker Image
+        run: |
+          docker build -t $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.tag }} .
+
+      # 8️⃣ Multi-tag best practice
+      - name: Tag Image
+        run: |
+          docker tag $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.tag }} \
+                     $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.version }}
+
+          docker tag $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.tag }} \
+                     $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}
+
+      # 9️⃣ Push all tags
+      - name: Push Image
+        run: |
+          docker push $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.tag }}
+          docker push $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.version }}
+          docker push $REGISTRY/$IMAGE_NAME:${{ steps.vars.outputs.short_sha }}
+
+  deploy-staging:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 🔟 Deploy container to STAGING slot
+      - name: Deploy to Staging Slot
+        run: |
+          az webapp config container set \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --slot staging \
+            --docker-custom-image-name \
+            $REGISTRY/$IMAGE_NAME:${{ needs.build-and-push.outputs.image_tag }} \
+            --docker-registry-server-url https://$REGISTRY \
+            --docker-registry-server-user ${{ secrets.ACR_USERNAME }} \
+            --docker-registry-server-password ${{ secrets.ACR_PASSWORD }}
+
+      # 1️⃣1️⃣ Restart slot (forces pull)
+      - name: Restart Staging Slot
+        run: |
+          az webapp restart \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --slot staging
+
+  swap-to-production:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      # 1️⃣2️⃣ Swap Slots (Auto)
+      - name: Swap staging to production
+        run: |
+          az webapp deployment slot swap \
+            --name $APP_NAME \
+            --resource-group $RESOURCE_GROUP \
+            --slot staging \
+            --target-slot production
